@@ -21,10 +21,18 @@ import { Onboarding } from '@/pages/Onboarding';
 export function App(): ReactNode {
   useTheme();
   const [seeded, setSeeded] = useState(false);
-  const profile = useLiveQuery(() => db.profile.get(PROFILE_ID), []);
+  // Coalesce the "no profile row yet" case to null so we can tell it apart
+  // from the "query still loading" case (both would otherwise be undefined).
+  const profile = useLiveQuery(
+    async () => (await db.profile.get(PROFILE_ID)) ?? null,
+    [],
+  );
 
   useEffect(() => {
-    ensureSeeded().then(() => setSeeded(true));
+    // Always release the splash, even if seeding fails, so the UI never hangs.
+    ensureSeeded()
+      .catch((err) => console.error('Seeding fehlgeschlagen:', err))
+      .finally(() => setSeeded(true));
   }, []);
 
   // Wait for seeding + the first profile read before deciding what to render.
@@ -32,7 +40,7 @@ export function App(): ReactNode {
     return <SplashScreen />;
   }
 
-  if (!profile) {
+  if (profile === null) {
     return <Onboarding onDone={() => { /* live query re-renders automatically */ }} />;
   }
 
