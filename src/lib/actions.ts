@@ -1,0 +1,188 @@
+import { db } from '@/db/database';
+import { nowISO, todayISO } from './date';
+import { addNutriments, EMPTY_NUTRIMENTS, scaleNutriments } from './nutrition';
+import type {
+  DiaryEntry,
+  DiaryItem,
+  InventoryItem,
+  MealType,
+  Nutriments,
+  OwnRecipe,
+} from '@/db/types';
+
+/** Time-of-day based default meal type, used to pre-select the picker. */
+export function defaultMealType(d = new Date()): MealType {
+  const h = d.getHours();
+  if (h < 10) return 'breakfast';
+  if (h < 15) return 'lunch';
+  if (h < 21) return 'dinner';
+  return 'snack';
+}
+
+/** Append a diary entry from a list of items. */
+async function bookDiary(mealType: MealType, items: DiaryItem[]): Promise<void> {
+  const totals = items.reduce<Nutriments>(
+    (acc, i) =>
+      addNutriments(acc, {
+        kcal: i.kcal,
+        protein: i.protein,
+        carbs: i.carbs,
+        fat: i.fat,
+      }),
+    { ...EMPTY_NUTRIMENTS },
+  );
+  const entry: DiaryEntry = {
+    datetime: nowISO(),
+    mealType,
+    items,
+    totals,
+  };
+  await db.diary.add(entry);
+}
+
+/**
+ * Log a single food portion: books it into the diary and — when it came from
+ * an inventory item — subtracts the amount from stock, then runs auto-restock.
+ */
+export async function logFood(args: {
+  mealType: MealType;
+  item: DiaryItem;
+}): Promise<void> {
+  await bookDiary(args.mealType, [args.item]);
+  if (args.item.sourceType === 'inventory' && args.item.refId !== undefined) {
+    await subtractInventory(args.item.refId, args.item.amount);
+  }
+  await runAutoRestock();
+}
+
+/**
+ * Cook a recipe: subtract every ingredient that matches inventory stock and
+ * book the recipe's per-serving nutrition (× servings cooked) into the diary.
+ */
+export async function cookRecipe(args: {
+  mealType: MealType;
+  recipe: OwnRecipe;
+  servingsCooked: number;
+}): Promise<void> {
+  const { recipe, servingsCooked, mealType } = args;
+  const inventory = await db.inventory.toArray();
+
+  // Subtract matched ingredients (scaled to the cooked portion of the recipe).
+  const factor = servingsCooked / Math.max(1, recipe.servings);
+  for (const ing of recipe.ingredients) {
+    const match = inventory.find(
+      (inv) =>
+        inv.unit === ing.unit && namesMatch(inv.name, ing.name) && inv.amount > 0,
+    );
+    if (match?.id !== undefined) {
+      await subtractInventory(match.id, ing.amount * factor);
+    }
+  }
+
+  const per = recipe.nutritionPerServing ?? EMPTY_NUTRIMENTS;
+  const scaled: Nutriments = {
+    kcal: per.kcal * servingsCooked,
+    protein: per.protein * servingsCooked,
+    carbs: per.carbs * servingsCooked,
+    fat: per.fat * servingsCooked,
+  };
+  const item: DiaryItem = {
+    name: recipe.title,
+    amount: servingsCooked,
+    unit: 'pcs',
+    kcal: scaled.kcal,
+    protein: scaled.protein,
+    carbs: scaled.carbs,
+    fat: scaled.fat,
+    sourceType: 'recipe',
+    refId: recipe.id,
+  };
+  await bookDiary(mealType, [item]);
+  await runAutoRestock();
+}
+
+/** Reduce an inventory item's amount, clamping at 0. */
+export async function subtractInventory(id: number, amount: number): Promise<void> {
+  const item = await db.inventory.get(id);
+  if (!item) return;
+  const next = Math.max(0, Math.round((item.amount - amount) * 10) / 10);
+  await db.inventory.update(id, { amount: next });
+}
+
+/** Build a scaled diary item from per-100g nutriments. */
+export function diaryItemFromPer100(args: {
+  name: string;
+  amount: number;
+  unit: DiaryItem['unit'];
+  per100: Nutriments;
+  sourceType: DiaryItem['sourceType'];
+  refId?: number;
+}): DiaryItem {
+  const n = scaleNutriments(args.per100, args.amount);
+  return {
+    name: args.name,
+    amount: args.amount,
+    unit: args.unit,
+    kcal: n.kcal,
+    protein: n.protein,
+    carbs: n.carbs,
+    fat: n.fat,
+    sourceType: args.sourceType,
+    refId: args.refId,
+  };
+}
+
+/**
+ * Auto-restock: staples below their minStock get added to the shopping list
+ * (no duplicates); they are removed again once refilled above the threshold.
+ */
+export async function runAutoRestock(): Promise<void> {
+  const [inventory, shopping] = await Promise.all([
+    db.inventory.toArray(),
+    db.shoppingList.toArray(),
+  ]);
+
+  for (const item of inventory) {
+    if (!item.isStaple || item.minStock === undefined || item.id === undefined) {
+      continue;
+    }
+    const low = item.amount < item.minStock;
+    const existing = shopping.find(
+      (s) => s.source === 'auto-restock' && s.linkedInventoryId === item.id,
+    );
+
+    if (low && !existing) {
+      await db.shoppingList.add({
+        name: item.name,
+        amount: item.minStock,
+        unit: item.unit,
+        checked: false,
+        source: 'auto-restock',
+        linkedInventoryId: item.id,
+        addedAt: nowISO(),
+      });
+    } else if (!low && existing?.id !== undefined && !existing.checked) {
+      // Refilled again -> remove the auto-generated entry.
+      await db.shoppingList.delete(existing.id);
+    }
+  }
+}
+
+function namesMatch(a: string, b: string): boolean {
+  const x = a.trim().toLowerCase();
+  const y = b.trim().toLowerCase();
+  return x === y || x.includes(y) || y.includes(x);
+}
+
+export function isExpiringSoon(item: InventoryItem, days = 3): boolean {
+  if (!item.bestBefore) return false;
+  const target = new Date(item.bestBefore + 'T00:00:00').getTime();
+  const now = new Date(todayISO() + 'T00:00:00').getTime();
+  return (target - now) / 86_400_000 <= days;
+}
+
+export function isLowStaple(item: InventoryItem): boolean {
+  return (
+    item.isStaple && item.minStock !== undefined && item.amount < item.minStock
+  );
+}
